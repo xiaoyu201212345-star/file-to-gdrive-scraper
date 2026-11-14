@@ -1,16 +1,24 @@
-import io
 import json
 import os
-from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload
 
-TARGET_URL = "https://docs.python.org/3/download.html"
+DOWNLOAD_URL = "https://dl.twrp.me/nx563j/twrp-3.7.0_9-0-nx563j.img"
+FILENAME = "twrp-3.7.0_9-0-nx563j.img"
+HEADERS = {
+    "Referer": "https://twrp.me/nubia/nubianx563j.html",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+MIN_FILE_SIZE = 1024 * 1024  # 1 MB
+
 
 def get_drive_service():
     creds_json = os.environ.get("GDRIVE_CREDENTIALS")
@@ -23,30 +31,46 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-def fetch_download_links(url):
-    print(f"Fetching {url}...")
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    links = []
-    seen = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if href.lower().endswith((".zip", ".pdf")):
-            full_url = urljoin(url, href)
-            if full_url not in seen:
-                seen.add(full_url)
-                links.append(full_url)
-    print(f"Found {len(links)} unique .zip/.pdf links.")
-    return links
+def download_and_verify(url, headers, output_path):
+    print(f"Downloading {url}...")
+    resp = requests.get(url, headers=headers, stream=True, timeout=120)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Download failed with HTTP status code {resp.status_code}"
+        )
+
+    content_type = resp.headers.get("Content-Type", "").lower()
+    if "text/html" in content_type:
+        raise ValueError(
+            f"Unexpected Content-Type '{content_type}': received HTML instead of binary image"
+        )
+
+    with open(output_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+
+    file_size = os.path.getsize(output_path)
+    with open(output_path, "rb") as f:
+        header_bytes = f.read(512).lstrip().lower()
+
+    if b"<html" in header_bytes or b"<!doctype" in header_bytes:
+        raise ValueError(
+            "Downloaded file starts with HTML content (<html or <!doctype), aborting upload"
+        )
+
+    if file_size <= MIN_FILE_SIZE:
+        raise ValueError(
+            f"Downloaded file size ({file_size} bytes) is not greater than 1MB, aborting upload"
+        )
+
+    print(f"Verified binary image saved to {output_path} ({file_size} bytes).")
 
 
-def file_exists_in_folder(service, folder_id, filename):
-    escaped_name = filename.replace("'", "\\'")
-    query = (
-        f"name = '{escaped_name}' and '{folder_id}' in parents and trashed = false"
-    )
-    result = (
+def file_exists_in_folder(service, filename, folder_id):
+    safe_name = filename.replace("'", "\\'")
+    query = f"name = '{safe_name}' and '{folder_id}' in parents and trashed = false"
+    results = (
         service.files()
         .list(
             q=query,
@@ -56,49 +80,46 @@ def file_exists_in_folder(service, folder_id, filename):
         )
         .execute()
     )
-    return len(result.get("files", [])) > 0
+    files = results.get("files", [])
+    return files[0] if files else None
 
 
-def upload_file(service, folder_id, file_url):
-    filename = os.path.basename(urlparse(file_url).path)
-    if not filename:
-        print(f"Skipping invalid URL: {file_url}")
-        return
-    if file_exists_in_folder(service, folder_id, filename):
-        print(f"Skipping {filename}: already exists in target folder.")
-        return
-    print(f"Downloading {file_url}...")
-    resp = requests.get(file_url, timeout=120)
-    resp.raise_for_status()
-    file_metadata = {"name": filename, "parents": [folder_id]}
-    media = MediaIoBaseUpload(
-        io.BytesIO(resp.content), mimetype="application/octet-stream", resumable=True
+def upload_to_drive(service, file_path, filename, folder_id):
+    media = MediaFileUpload(
+        file_path, mimetype="application/octet-stream", resumable=True
     )
-    print(f"Uploading {filename} to Google Drive...")
+    metadata = {"name": filename, "parents": [folder_id]}
+    print(f"Uploading {filename} to Google Drive folder {folder_id}...")
     uploaded = (
         service.files()
         .create(
-            body=file_metadata,
+            body=metadata,
             media_body=media,
             fields="id, name",
             supportsAllDrives=True,
         )
         .execute()
     )
-    print(f"Uploaded {uploaded.get('name')} (ID: {uploaded.get('id')})")
+    print(f"Successfully uploaded {uploaded.get('name')} (ID: {uploaded.get('id')}).")
 
 
 def main():
     folder_id = os.environ.get("GDRIVE_FOLDER_ID")
     if not folder_id:
         raise ValueError("Missing GDRIVE_FOLDER_ID environment variable")
+
+    download_and_verify(DOWNLOAD_URL, HEADERS, FILENAME)
+
     service = get_drive_service()
-    links = fetch_download_links(TARGET_URL)
-    for link in links:
-        try:
-            upload_file(service, folder_id, link)
-        except Exception as exc:
-            print(f"Error processing {link}: {exc}")
+    existing = file_exists_in_folder(service, FILENAME, folder_id)
+    if existing:
+        print(
+            f"File '{FILENAME}' already exists in folder {folder_id} "
+            f"(ID: {existing.get('id')}). Skipping upload."
+        )
+        return
+
+    upload_to_drive(service, FILENAME, FILENAME, folder_id)
 
 
 if __name__ == "__main__":
